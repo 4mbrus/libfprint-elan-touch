@@ -1,0 +1,11 @@
+# libfprint checkout + build output from build.sh
+/build/
+
+# debug logs and test results (contain your username / device details)
+*.log
+scripts/.fprintd-debug.pid
+scripts/verify-results.txt
+
+# never commit raw fingerprint captures
+*.bin
+*.pgm

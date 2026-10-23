@@ -1,0 +1,944 @@
+diff --git a/libfprint/drivers/elan.c b/libfprint/drivers/elan.c
+index 1b5d1e7..ce54e0c 100644
+--- a/libfprint/drivers/elan.c
++++ b/libfprint/drivers/elan.c
+@@ -83,6 +83,7 @@ struct _FpiDeviceElan
+   unsigned char   frame_height;
+   unsigned char   raw_frame_height;
+   int             num_frames;
++  int             extra_frames; /* touch mode: frames dropped while waiting for finger off */
+   GSList         *frames;
+   /* end state */
+ };
+@@ -110,6 +111,7 @@ elan_dev_reset_state (FpiDeviceElan *elandev)
+   g_slist_free_full (elandev->frames, g_free);
+   elandev->frames = NULL;
+   elandev->num_frames = 0;
++  elandev->extra_frames = 0;
+ }
+ 
+ static void
+@@ -316,6 +318,42 @@ elan_submit_image (FpImageDevice *dev)
+ 
+   raw_frames = g_slist_nth (self->frames, ELAN_SKIP_LAST_FRAMES);
+ 
++  if (self->dev_type & ELAN_TOUCH)
++    {
++      /* Touch sensor: the finger doesn't move, so use the frame with the
++       * strongest contact (largest signal above background). */
++      unsigned int frame_size = self->frame_width * self->frame_height;
++      unsigned short *best = NULL;
++      guint64 best_sum = 0;
++      struct fpi_frame *frame;
++
++      for (GSList *l = raw_frames; l; l = l->next)
++        {
++          unsigned short *f = l->data;
++          guint64 sum = 0;
++
++          for (unsigned int i = 0; i < frame_size; i++)
++            sum += f[i];
++          if (!best || sum > best_sum)
++            {
++              best = f;
++              best_sum = sum;
++            }
++        }
++
++      assembling_ctx.frame_width = self->frame_width;
++      assembling_ctx.frame_height = self->frame_height;
++      self->process_frame (best, &frames);
++      frame = frames->data;
++
++      img = fp_image_new (self->frame_width, self->frame_height);
++      memcpy (img->data, frame->data, frame_size);
++      g_slist_free_full (frames, g_free);
++
++      fpi_image_device_image_captured (dev, img);
++      return;
++    }
++
+   assembling_ctx.frame_width = self->frame_width;
+   assembling_ctx.frame_height = self->frame_height;
+   assembling_ctx.image_width = self->frame_width * 3 / 2;
+@@ -549,6 +587,9 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
+         }
+       else
+         {
++          fp_dbg ("pre-scan reply: %s 0x%02x",
++                  self->last_read ? "byte" : "no data",
++                  self->last_read ? self->last_read[0] : 0);
+           /* XXX: The timeout is emulated incorrectly, resulting in a zero byte read. */
+           if (g_strcmp0 (g_getenv ("FP_DEVICE_EMULATION"), "1") == 0)
+             fpi_ssm_mark_completed (ssm);
+@@ -569,6 +610,20 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
+           self->cmd_timeout = ELAN_FINGER_TIMEOUT;
+           fpi_ssm_jump_to_state (ssm, CAPTURE_WAIT_FINGER);
+         }
++      else if ((self->dev_type & ELAN_TOUCH) &&
++               self->extra_frames < ELAN_TOUCH_MAX_EXTRA_FRAMES)
++        {
++          /* Finger still down: drop the oldest frame and keep polling until
++           * it is lifted, otherwise the next calibration sees the finger. */
++          GSList *oldest = g_slist_last (self->frames);
++
++          g_free (oldest->data);
++          self->frames = g_slist_delete_link (self->frames, oldest);
++          self->num_frames -= 1;
++          self->extra_frames += 1;
++          self->cmd_timeout = ELAN_FINGER_TIMEOUT;
++          fpi_ssm_jump_to_state (ssm, CAPTURE_WAIT_FINGER);
++        }
+       else
+         {
+           fpi_ssm_next_state (ssm);
+@@ -602,6 +657,15 @@ capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
+         }
+       g_clear_error (&error);
+     }
++  else if ((self->dev_type & ELAN_TOUCH) &&
++           g_error_matches (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO))
++    {
++      /* Unexpected pre-scan reply (seen: 0xaf after a bad calibration).
++       * Ask for another touch instead of aborting the whole session. */
++      fp_dbg ("unexpected pre-scan reply, asking for a retry");
++      fpi_image_device_retry_scan (dev, FP_DEVICE_RETRY_REMOVE_FINGER);
++      g_clear_error (&error);
++    }
+   else
+     {
+       fpi_image_device_session_error (dev, error);
+@@ -859,7 +923,8 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
+           self->frame_height++;
+           self->raw_frame_height = self->frame_height;
+         }
+-      if (self->frame_height > ELAN_MAX_FRAME_HEIGHT)
++      if (self->frame_height > ELAN_MAX_FRAME_HEIGHT &&
++          !(self->dev_type & ELAN_TOUCH))
+         self->frame_height = ELAN_MAX_FRAME_HEIGHT;
+       fp_dbg ("sensor dimensions, WxH: %dx%d", self->frame_width,
+               self->raw_frame_height);
+@@ -927,6 +992,24 @@ dev_init (FpImageDevice *dev)
+       break;
+     }
+ 
++  if (self->dev_type & ELAN_TOUCH)
++    {
++      const char *env;
++      gint threshold = ELAN_TOUCH_THRESHOLD;
++      gint stages = ELAN_TOUCH_ENROLL_STAGES;
++
++      if ((env = g_getenv ("ELAN_TOUCH_THRESHOLD")) && atoi (env) > 0)
++        threshold = atoi (env);
++      if ((env = g_getenv ("ELAN_TOUCH_ENROLL_STAGES")) && atoi (env) > 0)
++        stages = atoi (env);
++
++      fp_dbg ("touch mode: SIFT matching, threshold %d, %d enroll stages",
++              threshold, stages);
++      fpi_image_device_set_sigfm_threshold (dev, threshold);
++      fpi_device_set_nr_enroll_stages (FP_DEVICE (dev), stages);
++      fpi_device_set_scan_type (FP_DEVICE (dev), FP_SCAN_TYPE_PRESS);
++    }
++
+   fpi_image_device_open_complete (dev, NULL);
+ }
+ 
+diff --git a/libfprint/drivers/elan.h b/libfprint/drivers/elan.h
+index 7d08994..be37f48 100644
+--- a/libfprint/drivers/elan.h
++++ b/libfprint/drivers/elan.h
+@@ -31,6 +31,17 @@
+ #define ELAN_0907 (1 << 0)
+ #define ELAN_0C03 (1 << 1)
+ #define ELAN_0C42 (1 << 2)
++/* Small press ("touch") sensors: no frame stitching, SIFT matching */
++#define ELAN_TOUCH (1 << 3)
++
++/* touch mode defaults, overridable with ELAN_TOUCH_THRESHOLD /
++ * ELAN_TOUCH_ENROLL_STAGES in the environment */
++#define ELAN_TOUCH_THRESHOLD 12
++#define ELAN_TOUCH_ENROLL_STAGES 15
++/* touch mode keeps polling (keeping only the newest ELAN_MAX_FRAMES) until the
++ * finger is lifted, so calibration never runs with a finger on the sensor;
++ * give up waiting after this many extra frames (~10 s) */
++#define ELAN_TOUCH_MAX_EXTRA_FRAMES 300
+ 
+ /* devices which don't require frame rotation before assembling */
+ #define ELAN_NOT_ROTATED ELAN_0C03
+@@ -219,7 +230,7 @@ static const FpIdEntry elan_id_table[] = {
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c4d, .driver_data = ELAN_ALL_DEV},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c4f, .driver_data = ELAN_ALL_DEV},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c63, .driver_data = ELAN_ALL_DEV},
+-  {.vid = ELAN_VEND_ID,  .pid = 0x0c6e, .driver_data = ELAN_ALL_DEV},
++  {.vid = ELAN_VEND_ID,  .pid = 0x0c6e, .driver_data = ELAN_TOUCH},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c58, .driver_data = ELAN_ALL_DEV},
+   {.vid = 0,  .pid = 0,  .driver_data = 0},
+ };
+diff --git a/libfprint/fp-image-device-private.h b/libfprint/fp-image-device-private.h
+index b075634..24bf0e7 100644
+--- a/libfprint/fp-image-device-private.h
++++ b/libfprint/fp-image-device-private.h
+@@ -37,6 +37,7 @@ typedef struct
+   FpImage            *capture_image;
+ 
+   gint                bz3_threshold;
++  gint                sigfm_threshold; /* > 0: use SIFT matching */
+ } FpImageDevicePrivate;
+ 
+ 
+diff --git a/libfprint/fp-image-device.c b/libfprint/fp-image-device.c
+index 519ad75..0dd7bc4 100644
+--- a/libfprint/fp-image-device.c
++++ b/libfprint/fp-image-device.c
+@@ -126,8 +126,15 @@ fp_image_device_start_capture_action (FpDevice *device)
+ 
+       fpi_device_get_enroll_data (device, &enroll_print);
+       g_object_get (enroll_print, "fpi-type", &print_type, NULL);
+-      if (print_type != FPI_PRINT_NBIS)
+-        fpi_print_set_type (enroll_print, FPI_PRINT_NBIS);
++      if (priv->sigfm_threshold > 0)
++        {
++          if (print_type != FPI_PRINT_SIGFM)
++            fpi_print_set_type (enroll_print, FPI_PRINT_SIGFM);
++        }
++      else if (print_type != FPI_PRINT_NBIS)
++        {
++          fpi_print_set_type (enroll_print, FPI_PRINT_NBIS);
++        }
+     }
+ 
+   priv->enroll_stage = 0;
+diff --git a/libfprint/fp-image.c b/libfprint/fp-image.c
+index f9c60b3..c29b104 100644
+--- a/libfprint/fp-image.c
++++ b/libfprint/fp-image.c
+@@ -26,6 +26,10 @@
+ 
+ #include <config.h>
+ #include <nbis.h>
++#include "sigfm/sigfm.h"
++
++/* Below this many keypoints a touch is too poor to match; ask for a retry. */
++#define SIGFM_MIN_KEYPOINTS 25
+ 
+ /**
+  * SECTION: fp-image
+@@ -64,6 +68,7 @@ fp_image_finalize (GObject *object)
+   g_clear_pointer (&self->data, g_free);
+   g_clear_pointer (&self->binarized, g_free);
+   g_clear_pointer (&self->minutiae, g_ptr_array_unref);
++  g_clear_pointer (&self->sigfm_info, sigfm_free_info);
+ 
+   G_OBJECT_CLASS (fp_image_parent_class)->finalize (object);
+ }
+@@ -165,6 +170,7 @@ typedef struct
+   FpiImageFlags       flags;
+   unsigned char      *image;
+   gboolean            image_changed;
++  SigfmImgInfo       *sigfm_info;
+ } DetectMinutiaeNbisData;
+ 
+ static void
+@@ -172,6 +178,7 @@ fp_image_detect_minutiae_free (DetectMinutiaeNbisData *data)
+ {
+   g_clear_pointer (&data->minutiae, free_minutiae);
+   g_clear_pointer (&data->binarized, g_free);
++  g_clear_pointer (&data->sigfm_info, sigfm_free_info);
+ 
+   if (data->image_changed)
+     g_clear_pointer (&data->image, g_free);
+@@ -201,6 +208,15 @@ fp_image_detect_minutiae_nbis_finish (FpImage *self,
+           self->data = g_steal_pointer (&data->image);
+         }
+ 
++      if (data->sigfm_info)
++        {
++          g_clear_pointer (&self->sigfm_info, sigfm_free_info);
++          self->sigfm_info = g_steal_pointer (&data->sigfm_info);
++          g_clear_pointer (&self->minutiae, g_ptr_array_unref);
++          self->minutiae = g_ptr_array_new ();
++          return TRUE;
++        }
++
+       g_clear_pointer (&self->binarized, g_free);
+       self->binarized = g_steal_pointer (&data->binarized);
+ 
+@@ -315,6 +331,30 @@ fp_image_detect_minutiae_nbis_thread_func (GTask        *task,
+   if (self->flags & FPI_IMAGE_COLORS_INVERTED)
+     invert_colors (image, self->width, self->height);
+ 
++  if (self->use_sigfm)
++    {
++      timer = g_timer_new ();
++      ret_data->sigfm_info = sigfm_extract (image, self->width, self->height);
++      g_timer_stop (timer);
++      fp_dbg ("SIFT extraction completed in %f secs, %d keypoints",
++              g_timer_elapsed (timer, NULL),
++              sigfm_keypoints_count (ret_data->sigfm_info));
++
++      if (g_task_had_error (thread_task))
++        return;
++
++      if (sigfm_keypoints_count (ret_data->sigfm_info) < SIGFM_MIN_KEYPOINTS)
++        {
++          g_task_return_new_error (thread_task, G_IO_ERROR, G_IO_ERROR_FAILED,
++                                   "Not enough keypoints found");
++          return;
++        }
++
++      g_task_return_pointer (thread_task, g_steal_pointer (&ret_data),
++                             (GDestroyNotify) fp_image_detect_minutiae_free);
++      return;
++    }
++
+   lfsparms = g_memdup2 (&g_lfsparms_V2, sizeof (LFSPARMS));
+   lfsparms->remove_perimeter_pts = minutiae_flags & FPI_IMAGE_PARTIAL ? TRUE : FALSE;
+ 
+diff --git a/libfprint/fp-print.c b/libfprint/fp-print.c
+index 9232316..ba77c49 100644
+--- a/libfprint/fp-print.c
++++ b/libfprint/fp-print.c
+@@ -22,6 +22,7 @@
+ 
+ #include "fp-print-private.h"
+ #include "fpi-compat.h"
++#include "sigfm/sigfm.h"
+ #include "fpi-log.h"
+ 
+ /**
+@@ -609,6 +610,25 @@ fp_print_equal (FpPrint *self, FpPrint *other)
+     {
+       return g_variant_equal (self->data, other->data);
+     }
++  else if (self->type == FPI_PRINT_SIGFM)
++    {
++      guint i;
++
++      if (self->prints->len != other->prints->len)
++        return FALSE;
++
++      for (i = 0; i < self->prints->len; i++)
++        {
++          int la, lb;
++          g_autofree unsigned char *a = sigfm_serialize_binary (g_ptr_array_index (self->prints, i), &la);
++          g_autofree unsigned char *b = sigfm_serialize_binary (g_ptr_array_index (other->prints, i), &lb);
++
++          if (la != lb || memcmp (a, b, la) != 0)
++            return FALSE;
++        }
++
++      return TRUE;
++    }
+   else if (self->type == FPI_PRINT_NBIS)
+     {
+       guint i;
+@@ -714,6 +734,25 @@ fp_print_serialize (FpPrint *print,
+       g_variant_builder_close (&nested);
+       g_variant_builder_add (&builder, "v", g_variant_builder_end (&nested));
+     }
++  else if (print->type == FPI_PRINT_SIGFM)
++    {
++      GVariantBuilder nested = G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE ("(aay)"));
++      guint i;
++
++      g_variant_builder_open (&nested, G_VARIANT_TYPE ("aay"));
++      for (i = 0; i < print->prints->len; i++)
++        {
++          int slen;
++          unsigned char *blob = sigfm_serialize_binary (g_ptr_array_index (print->prints, i), &slen);
++
++          g_variant_builder_add_value (&nested,
++                                       g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
++                                                                  blob, slen, 1));
++          free (blob);
++        }
++      g_variant_builder_close (&nested);
++      g_variant_builder_add (&builder, "v", g_variant_builder_end (&nested));
++    }
+   else
+     {
+       g_variant_builder_add (&builder, "v", g_variant_new_variant (print->data));
+@@ -821,7 +860,31 @@ fp_print_deserialize (const guchar *data,
+   finger = finger_int8;
+ 
+   /* Assume data is valid at this point if the values are somewhat sane. */
+-  if (type == FPI_PRINT_NBIS)
++  if (type == FPI_PRINT_SIGFM)
++    {
++      g_autoptr(GVariant) prints = g_variant_get_child_value (print_data, 0);
++      guint i;
++
++      result = g_object_new (FP_TYPE_PRINT,
++                             "driver", driver,
++                             "device-id", device_id,
++                             "device-stored", device_stored,
++                             NULL);
++      g_object_ref_sink (result);
++      fpi_print_set_type (result, FPI_PRINT_SIGFM);
++      for (i = 0; i < g_variant_n_children (prints); i++)
++        {
++          g_autoptr(GVariant) blob = g_variant_get_child_value (prints, i);
++          gsize blen;
++          const guchar *bytes = g_variant_get_fixed_array (blob, &blen, 1);
++          SigfmImgInfo *info = sigfm_deserialize_binary (bytes, (int) blen);
++
++          if (!info)
++            goto invalid_format;
++          g_ptr_array_add (result->prints, info);
++        }
++    }
++  else if (type == FPI_PRINT_NBIS)
+     {
+       g_autoptr(GVariant) prints = g_variant_get_child_value (print_data, 0);
+       guint i;
+diff --git a/libfprint/fpi-image-device.c b/libfprint/fpi-image-device.c
+index 8184d3a..fddbe15 100644
+--- a/libfprint/fpi-image-device.c
++++ b/libfprint/fpi-image-device.c
+@@ -21,6 +21,7 @@
+ #include "fpi-log.h"
+ 
+ #include "fp-image-device-private.h"
++#include "fpi-image.h"
+ #include "fp-image-device.h"
+ 
+ /**
+@@ -276,7 +277,7 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+   if (!error)
+     {
+       print = fp_print_new (device);
+-      fpi_print_set_type (print, FPI_PRINT_NBIS);
++      fpi_print_set_type (print, priv->sigfm_threshold > 0 ? FPI_PRINT_SIGFM : FPI_PRINT_NBIS);
+       if (!fpi_print_add_from_image (print, image, &error))
+         {
+           g_clear_object (&print);
+@@ -322,7 +323,9 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+       FpiMatchResult result;
+ 
+       fpi_device_get_verify_data (device, &template);
+-      if (print)
++      if (print && priv->sigfm_threshold > 0)
++        result = fpi_print_sigfm_match (template, print, priv->sigfm_threshold, &error);
++      else if (print)
+         result = fpi_print_bz3_match (template, print, priv->bz3_threshold, &error);
+       else
+         result = FPI_MATCH_ERROR;
+@@ -343,7 +346,11 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+         {
+           FpPrint *template = g_ptr_array_index (templates, i);
+ 
+-          if (fpi_print_bz3_match (template, print, priv->bz3_threshold, &error) == FPI_MATCH_SUCCESS)
++          FpiMatchResult r = priv->sigfm_threshold > 0 ?
++                             fpi_print_sigfm_match (template, print, priv->sigfm_threshold, &error) :
++                             fpi_print_bz3_match (template, print, priv->bz3_threshold, &error);
++
++          if (r == FPI_MATCH_SUCCESS)
+             {
+               result = template;
+               break;
+@@ -392,6 +399,26 @@ fpi_image_device_set_bz3_threshold (FpImageDevice *self,
+   priv->bz3_threshold = bz3_threshold;
+ }
+ 
++/**
++ * fpi_image_device_set_sigfm_threshold:
++ * @self: a #FpImageDevice imaging fingerprint device
++ * @threshold: SIFT match threshold, or 0 to use NBIS (the default)
++ *
++ * Switch the device to SIFT keypoint matching, for press sensors too small
++ * for minutiae matching. Call from the probe or open callback.
++ */
++void
++fpi_image_device_set_sigfm_threshold (FpImageDevice *self,
++                                      gint           threshold)
++{
++  FpImageDevicePrivate *priv = fp_image_device_get_instance_private (self);
++
++  g_return_if_fail (FP_IS_IMAGE_DEVICE (self));
++  g_return_if_fail (threshold >= 0);
++
++  priv->sigfm_threshold = threshold;
++}
++
+ /**
+  * fpi_image_device_report_finger_status:
+  * @self: a #FpImageDevice imaging fingerprint device
+@@ -493,6 +520,7 @@ fpi_image_device_image_captured (FpImageDevice *self, FpImage *image)
+   g_debug ("Image device captured an image");
+ 
+   priv->minutiae_scan_active = TRUE;
++  image->use_sigfm = priv->sigfm_threshold > 0;
+ 
+   /* XXX: We also detect minutiae in capture mode, we solely do this
+    *      to normalize the image which will happen as a by-product. */
+diff --git a/libfprint/fpi-image-device.h b/libfprint/fpi-image-device.h
+index 71472db..cb7d64e 100644
+--- a/libfprint/fpi-image-device.h
++++ b/libfprint/fpi-image-device.h
+@@ -116,6 +116,8 @@ struct _FpImageDeviceClass
+   void          (*deactivate)   (FpImageDevice *dev);
+ };
+ 
++void fpi_image_device_set_sigfm_threshold (FpImageDevice *self,
++                                           gint           threshold);
+ void fpi_image_device_set_bz3_threshold (FpImageDevice *self,
+                                          gint           bz3_threshold);
+ 
+diff --git a/libfprint/fpi-image.h b/libfprint/fpi-image.h
+index 0c703fb..57d7e18 100644
+--- a/libfprint/fpi-image.h
++++ b/libfprint/fpi-image.h
+@@ -70,6 +70,10 @@ struct _FpImage
+   GPtrArray *minutiae;
+ 
+   gboolean   detection_in_progress;
++
++  /* SIFT mode: extract keypoints instead of NBIS minutiae. */
++  gboolean   use_sigfm;
++  gpointer   sigfm_info;
+ };
+ 
+ gint fpi_std_sq_dev (const guint8 *buf,
+diff --git a/libfprint/fpi-print.c b/libfprint/fpi-print.c
+index 00289b4..c557fdf 100644
+--- a/libfprint/fpi-print.c
++++ b/libfprint/fpi-print.c
+@@ -24,6 +24,7 @@
+ #include "fp-print-private.h"
+ #include "fpi-device.h"
+ #include "fpi-compat.h"
++#include "sigfm/sigfm.h"
+ 
+ /**
+  * SECTION: fpi-print
+@@ -46,11 +47,15 @@
+ void
+ fpi_print_add_print (FpPrint *print, FpPrint *add)
+ {
+-  g_return_if_fail (print->type == FPI_PRINT_NBIS);
+-  g_return_if_fail (add->type == FPI_PRINT_NBIS);
++  g_return_if_fail (print->type == FPI_PRINT_NBIS ||
++                    print->type == FPI_PRINT_SIGFM);
++  g_return_if_fail (add->type == print->type);
+ 
+   g_assert (add->prints->len == 1);
+-  g_ptr_array_add (print->prints, g_memdup2 (add->prints->pdata[0], sizeof (struct xyt_struct)));
++  if (print->type == FPI_PRINT_SIGFM)
++    g_ptr_array_add (print->prints, sigfm_copy_info (add->prints->pdata[0]));
++  else
++    g_ptr_array_add (print->prints, g_memdup2 (add->prints->pdata[0], sizeof (struct xyt_struct)));
+ }
+ 
+ /**
+@@ -76,6 +81,11 @@ fpi_print_set_type (FpPrint     *print,
+       g_assert_null (print->prints);
+       print->prints = g_ptr_array_new_with_free_func (g_free);
+     }
++  else if (print->type == FPI_PRINT_SIGFM)
++    {
++      g_assert_null (print->prints);
++      print->prints = g_ptr_array_new_with_free_func ((GDestroyNotify) sigfm_free_info);
++    }
+   g_object_notify (G_OBJECT (print), "fpi-type");
+ }
+ 
+@@ -160,6 +170,15 @@ fpi_print_add_from_image (FpPrint *print,
+   struct fp_minutiae _minutiae;
+   struct xyt_struct *xyt;
+ 
++  if (print->type == FPI_PRINT_SIGFM && image && image->sigfm_info)
++    {
++      g_ptr_array_add (print->prints, sigfm_copy_info (image->sigfm_info));
++      g_clear_object (&print->image);
++      print->image = g_object_ref (image);
++      g_object_notify (G_OBJECT (print), "image");
++      return TRUE;
++    }
++
+   if (print->type != FPI_PRINT_NBIS || !image)
+     {
+       g_set_error (error,
+@@ -249,6 +268,52 @@ fpi_print_bz3_match (FpPrint *template, FpPrint *print, gint bz3_threshold, GErr
+   return FPI_MATCH_FAIL;
+ }
+ 
++/**
++ * fpi_print_sigfm_match:
++ * @template: A #FpPrint containing one or more SIGFM prints
++ * @print: A newly scanned #FpPrint (exactly one print)
++ * @threshold: Minimum score for a match
++ * @error: Return location for error
++ *
++ * Returns: Whether the prints match
++ */
++FpiMatchResult
++fpi_print_sigfm_match (FpPrint *template, FpPrint *print, gint threshold, GError **error)
++{
++  SigfmImgInfo *probe;
++  gint best = 0;
++  guint i;
++
++  if (template->type != FPI_PRINT_SIGFM || print->type != FPI_PRINT_SIGFM)
++    {
++      *error = fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
++                                         "It is only possible to match SIGFM type print data");
++      return FPI_MATCH_ERROR;
++    }
++
++  if (print->prints->len != 1)
++    {
++      *error = fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
++                                         "New print contains more than one print!");
++      return FPI_MATCH_ERROR;
++    }
++
++  probe = g_ptr_array_index (print->prints, 0);
++  for (i = 0; i < template->prints->len; i++)
++    {
++      gint score = sigfm_match_score (probe, g_ptr_array_index (template->prints, i));
++
++      fp_dbg ("sigfm score %d/%d", score, threshold);
++      if (score > best)
++        best = score;
++      if (score >= threshold)
++        return FPI_MATCH_SUCCESS;
++    }
++
++  fp_dbg ("sigfm best score %d/%d", best, threshold);
++  return FPI_MATCH_FAIL;
++}
++
+ /**
+  * fpi_print_generate_user_id:
+  * @print: #FpPrint to generate the ID for
+diff --git a/libfprint/fpi-print.h b/libfprint/fpi-print.h
+index f3e72b4..6f3db9f 100644
+--- a/libfprint/fpi-print.h
++++ b/libfprint/fpi-print.h
+@@ -11,11 +11,13 @@ G_BEGIN_DECLS
+  * @FPI_PRINT_UNDEFINED: Undefined type, this happens prior to enrollment
+  * @FPI_PRINT_RAW: A raw print where the data is directly compared
+  * @FPI_PRINT_NBIS: NBIS minutiae comparison
++ * @FPI_PRINT_SIGFM: SIFT keypoint comparison (small press sensors)
+  */
+ typedef enum {
+   FPI_PRINT_UNDEFINED = 0,
+   FPI_PRINT_RAW,
+   FPI_PRINT_NBIS,
++  FPI_PRINT_SIGFM,
+ } FpiPrintType;
+ 
+ /**
+@@ -42,6 +44,11 @@ gboolean fpi_print_add_from_image (FpPrint *print,
+                                    FpImage *image,
+                                    GError **error);
+ 
++FpiMatchResult fpi_print_sigfm_match (FpPrint *temp,
++                                      FpPrint *print,
++                                      gint     threshold,
++                                      GError **error);
++
+ FpiMatchResult fpi_print_bz3_match (FpPrint *temp,
+                                     FpPrint *print,
+                                     gint     bz3_threshold,
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index 0ca1767..81c9a04 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -246,6 +246,18 @@ deps += declare_dependency(include_directories: [
+     include_directories('nbis/libfprint-include'),
+ ])
+ 
++# SIFT matcher for small press sensors (see sigfm/sigfm.h)
++opencv_inc = include_directories('/usr/include/opencv4')
++opencv_deps = []
++foreach m : ['core', 'imgproc', 'features2d', 'calib3d', 'flann']
++    opencv_deps += cpp.find_library('opencv_' + m)
++endforeach
++libsigfm = static_library('sigfm',
++    'sigfm/sigfm.cpp',
++    include_directories: opencv_inc,
++    dependencies: opencv_deps,
++    install: false)
++
+ libnbis = static_library('nbis',
+     nbis_sources,
+     dependencies: deps,
+@@ -263,8 +275,8 @@ libfprint_private = static_library('fprint-private',
+         fpi_enums,
+         libfprint_private_sources,
+     ],
+-    dependencies: deps,
+-    link_with: libnbis,
++    dependencies: deps + opencv_deps,
++    link_with: [libnbis, libsigfm],
+     install: false)
+ 
+ libfprint_drivers = static_library('fprint-drivers',
+diff --git a/libfprint/sigfm/sigfm.cpp b/libfprint/sigfm/sigfm.cpp
+new file mode 100644
+index 0000000..970cde4
+--- /dev/null
++++ b/libfprint/sigfm/sigfm.cpp
+@@ -0,0 +1,211 @@
++/*
++ * SIFT-based matching for small-area press sensors. See sigfm.h.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include "sigfm.h"
++
++#include <opencv2/calib3d.hpp>
++#include <opencv2/core.hpp>
++#include <opencv2/features2d.hpp>
++#include <opencv2/imgproc.hpp>
++
++#include <cmath>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++struct SigfmImgInfo
++{
++  std::vector<cv::KeyPoint> keypoints;
++  cv::Mat                   descriptors; /* CV_32F, one row per keypoint */
++};
++
++namespace {
++
++/* Tuned on ELAN 04f3:0c6e touch captures (150x52 px). */
++constexpr double kUpscale = 2.0;        /* SIFT works better on the upscaled image */
++constexpr double kRatio = 0.75;         /* Lowe ratio test */
++constexpr double kRansacPx = 6.0;       /* reprojection threshold, upscaled pixels */
++constexpr double kMinScale = 0.85;      /* a real finger is not resized between touches */
++constexpr double kMaxScale = 1.15;
++
++constexpr uint32_t kMagic = 0x314d4653; /* "SFM1" */
++
++template<typename T> void
++put (std::vector<unsigned char> &out, T v)
++{
++  const unsigned char *p = reinterpret_cast<const unsigned char *> (&v);
++  out.insert (out.end (), p, p + sizeof (T));
++}
++
++template<typename T> bool
++get (const unsigned char *&p, const unsigned char *end, T &v)
++{
++  if (end - p < (std::ptrdiff_t) sizeof (T))
++    return false;
++  std::memcpy (&v, p, sizeof (T));
++  p += sizeof (T);
++  return true;
++}
++
++} // namespace
++
++extern "C" SigfmImgInfo *
++sigfm_extract (const unsigned char *pix, int width, int height)
++{
++  try
++    {
++      cv::Mat img (height, width, CV_8UC1, const_cast<unsigned char *> (pix));
++      cv::Mat big;
++      cv::resize (img, big, cv::Size (), kUpscale, kUpscale, cv::INTER_CUBIC);
++
++      auto *info = new SigfmImgInfo;
++      cv::SIFT::create ()->detectAndCompute (big, cv::noArray (),
++                                             info->keypoints, info->descriptors);
++      if (info->descriptors.type () != CV_32F && !info->descriptors.empty ())
++        info->descriptors.convertTo (info->descriptors, CV_32F);
++      return info;
++    }
++  catch (...)
++    {
++      return nullptr;
++    }
++}
++
++extern "C" void
++sigfm_free_info (SigfmImgInfo *info)
++{
++  delete info;
++}
++
++extern "C" SigfmImgInfo *
++sigfm_copy_info (const SigfmImgInfo *info)
++{
++  auto *copy = new SigfmImgInfo;
++  copy->keypoints = info->keypoints;
++  copy->descriptors = info->descriptors.clone ();
++  return copy;
++}
++
++extern "C" int
++sigfm_keypoints_count (const SigfmImgInfo *info)
++{
++  return info ? (int) info->keypoints.size () : 0;
++}
++
++extern "C" int
++sigfm_match_score (const SigfmImgInfo *probe, const SigfmImgInfo *enrolled)
++{
++  try
++    {
++      if (!probe || !enrolled ||
++          probe->keypoints.size () < 3 || enrolled->keypoints.size () < 3)
++        return 0;
++
++      std::vector<std::vector<cv::DMatch>> knn;
++      cv::BFMatcher (cv::NORM_L2).knnMatch (probe->descriptors,
++                                           enrolled->descriptors, knn, 2);
++
++      std::vector<cv::Point2f> pa, pb;
++      for (const auto &m : knn)
++        {
++          if (m.size () == 2 && m[0].distance < kRatio * m[1].distance)
++            {
++              pa.push_back (probe->keypoints[m[0].queryIdx].pt);
++              pb.push_back (enrolled->keypoints[m[0].trainIdx].pt);
++            }
++        }
++      if (pa.size () < 3)
++        return 0;
++
++      std::vector<uchar> inliers;
++      cv::Mat M = cv::estimateAffinePartial2D (pa, pb, inliers, cv::RANSAC,
++                                               kRansacPx);
++      if (M.empty ())
++        return 0;
++
++      const double scale = std::hypot (M.at<double> (0, 0), M.at<double> (1, 0));
++      if (scale < kMinScale || scale > kMaxScale)
++        return 0;
++
++      return cv::countNonZero (inliers);
++    }
++  catch (...)
++    {
++      return -1;
++    }
++}
++
++extern "C" unsigned char *
++sigfm_serialize_binary (const SigfmImgInfo *info, int *outlen)
++{
++  std::vector<unsigned char> out;
++  const cv::Mat &d = info->descriptors;
++
++  put<uint32_t> (out, kMagic);
++  put<uint32_t> (out, (uint32_t) info->keypoints.size ());
++  for (const auto &k : info->keypoints)
++    {
++      put<float> (out, k.pt.x);
++      put<float> (out, k.pt.y);
++      put<float> (out, k.size);
++      put<float> (out, k.angle);
++      put<float> (out, k.response);
++      put<int32_t> (out, k.octave);
++    }
++  put<uint32_t> (out, (uint32_t) d.rows);
++  put<uint32_t> (out, (uint32_t) d.cols);
++  for (int r = 0; r < d.rows; r++)
++    {
++      const float *row = d.ptr<float> (r);
++      const unsigned char *p = reinterpret_cast<const unsigned char *> (row);
++      out.insert (out.end (), p, p + d.cols * sizeof (float));
++    }
++
++  auto *buf = static_cast<unsigned char *> (std::malloc (out.size ()));
++  std::memcpy (buf, out.data (), out.size ());
++  *outlen = (int) out.size ();
++  return buf;
++}
++
++extern "C" SigfmImgInfo *
++sigfm_deserialize_binary (const unsigned char *bytes, int len)
++{
++  const unsigned char *p = bytes, *end = bytes + len;
++  uint32_t magic, n, rows, cols;
++
++  if (!get (p, end, magic) || magic != kMagic || !get (p, end, n) || n > 100000)
++    return nullptr;
++
++  auto *info = new SigfmImgInfo;
++  info->keypoints.reserve (n);
++  for (uint32_t i = 0; i < n; i++)
++    {
++      float x, y, size, angle, response;
++      int32_t octave;
++      if (!get (p, end, x) || !get (p, end, y) || !get (p, end, size) ||
++          !get (p, end, angle) || !get (p, end, response) || !get (p, end, octave))
++        {
++          delete info;
++          return nullptr;
++        }
++      info->keypoints.emplace_back (cv::Point2f (x, y), size, angle, response, octave);
++    }
++
++  if (!get (p, end, rows) || !get (p, end, cols) || rows != n || cols > 1024 ||
++      (std::size_t) (end - p) != (std::size_t) rows * cols * sizeof (float))
++    {
++      delete info;
++      return nullptr;
++    }
++  info->descriptors.create ((int) rows, (int) cols, CV_32F);
++  if (rows > 0)
++    std::memcpy (info->descriptors.data, p, (std::size_t) rows * cols * sizeof (float));
++  return info;
++}
+diff --git a/libfprint/sigfm/sigfm.h b/libfprint/sigfm/sigfm.h
+new file mode 100644
+index 0000000..d2dcc77
+--- /dev/null
++++ b/libfprint/sigfm/sigfm.h
+@@ -0,0 +1,44 @@
++/*
++ * SIFT-based matching for small-area press sensors.
++ *
++ * API modelled on SIGFM by Matthieu Charette, Natasha England-Elbro and
++ * Timur Mangliev (goodix-fp-linux-dev/libfprint, "sigfm" branch). The
++ * matching step here uses a rigid RANSAC fit instead of SIGFM's pairwise
++ * angle voting.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#pragma once
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct SigfmImgInfo SigfmImgInfo;
++
++/* Extract SIFT keypoints and descriptors from an 8-bit grey image. */
++SigfmImgInfo *sigfm_extract (const unsigned char *pix, int width, int height);
++
++void sigfm_free_info (SigfmImgInfo *info);
++
++SigfmImgInfo *sigfm_copy_info (const SigfmImgInfo *info);
++
++int sigfm_keypoints_count (const SigfmImgInfo *info);
++
++/* Number of keypoint matches consistent with one rotation + shift.
++ * Returns 0 for no match, < 0 on internal error. */
++int sigfm_match_score (const SigfmImgInfo *probe, const SigfmImgInfo *enrolled);
++
++/* Serialise to a newly malloc()ed buffer; free it with free(). */
++unsigned char *sigfm_serialize_binary (const SigfmImgInfo *info, int *outlen);
++
++/* Returns NULL if the data is malformed. */
++SigfmImgInfo *sigfm_deserialize_binary (const unsigned char *bytes, int len);
++
++#ifdef __cplusplus
++}
++#endif
