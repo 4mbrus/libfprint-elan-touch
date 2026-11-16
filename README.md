@@ -35,6 +35,9 @@ against libfprint **v1.94.9**:
   frames are captured (about half a second), while the finger is still on the sensor. The driver
   keeps waiting for the lift afterwards so the next calibration never sees a finger.
   Set `ELAN_TOUCH_SUBMIT_FRAMES` to change the frame count (default 15, minimum 9); a value above 30 turns this off.
+- **No spurious retry after waking.** The sensor answers `0xcc` to the first pre-scan after it
+  is claimed (every lock/wake), with no finger on it. The driver now recalibrates once quietly
+  instead of showing "remove finger and retry"; a second failure still shows the message.
 - **Retry instead of abort** if the sensor still sends an unexpected reply.
 - **Defaults:** 15 enroll touches, match threshold 12.
 
