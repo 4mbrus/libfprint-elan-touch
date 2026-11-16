@@ -27,6 +27,7 @@ Environment=LD_LIBRARY_PATH=$DEST/lib
 # Tuning (defaults shown):
 #Environment=ELAN_TOUCH_THRESHOLD=12
 #Environment=ELAN_TOUCH_ENROLL_STAGES=15
+#Environment=ELAN_TOUCH_SUBMIT_FRAMES=30   # >30 = report only after the finger is lifted
 EOF
 
 echo "3/4 keeping the OpenCV runtime libraries installed"

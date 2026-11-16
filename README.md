@@ -31,6 +31,10 @@ against libfprint **v1.94.9**:
   0–4 minutiae.
 - **New print type `FPI_PRINT_SIGFM`**, with save/load support so fprintd can store
   the prints.
+- **Result before you lift.** The match / no-match result is reported as soon as 30
+  frames are captured (about a second), while the finger is still on the sensor. The driver
+  keeps waiting for the lift afterwards so the next calibration never sees a finger.
+  Set `ELAN_TOUCH_SUBMIT_FRAMES` to change the frame count; a value above 30 turns this off.
 - **Retry instead of abort** if the sensor still sends an unexpected reply.
 - **Defaults:** 15 enroll touches, match threshold 12.
 

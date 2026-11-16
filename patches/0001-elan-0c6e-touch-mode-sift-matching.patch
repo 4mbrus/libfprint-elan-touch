@@ -1,24 +1,27 @@
 diff --git a/libfprint/drivers/elan.c b/libfprint/drivers/elan.c
-index 1b5d1e7..ce54e0c 100644
+index 1b5d1e7..e057b28 100644
 --- a/libfprint/drivers/elan.c
 +++ b/libfprint/drivers/elan.c
-@@ -83,6 +83,7 @@ struct _FpiDeviceElan
+@@ -83,6 +83,9 @@ struct _FpiDeviceElan
    unsigned char   frame_height;
    unsigned char   raw_frame_height;
    int             num_frames;
 +  int             extra_frames; /* touch mode: frames dropped while waiting for finger off */
++  int             touch_submit_frames; /* touch mode: frames held before the early submit (> ELAN_MAX_FRAMES = off) */
++  gboolean        touch_submitted; /* touch mode: image already submitted, only waiting for finger off */
    GSList         *frames;
    /* end state */
  };
-@@ -110,6 +111,7 @@ elan_dev_reset_state (FpiDeviceElan *elandev)
+@@ -110,6 +113,8 @@ elan_dev_reset_state (FpiDeviceElan *elandev)
    g_slist_free_full (elandev->frames, g_free);
    elandev->frames = NULL;
    elandev->num_frames = 0;
 +  elandev->extra_frames = 0;
++  elandev->touch_submitted = FALSE;
  }
  
  static void
-@@ -316,6 +318,42 @@ elan_submit_image (FpImageDevice *dev)
+@@ -316,6 +321,42 @@ elan_submit_image (FpImageDevice *dev)
  
    raw_frames = g_slist_nth (self->frames, ELAN_SKIP_LAST_FRAMES);
  
@@ -61,7 +64,7 @@ index 1b5d1e7..ce54e0c 100644
    assembling_ctx.frame_width = self->frame_width;
    assembling_ctx.frame_height = self->frame_height;
    assembling_ctx.image_width = self->frame_width * 3 / 2;
-@@ -549,6 +587,9 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
+@@ -549,6 +590,9 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
          }
        else
          {
@@ -71,7 +74,7 @@ index 1b5d1e7..ce54e0c 100644
            /* XXX: The timeout is emulated incorrectly, resulting in a zero byte read. */
            if (g_strcmp0 (g_getenv ("FP_DEVICE_EMULATION"), "1") == 0)
              fpi_ssm_mark_completed (ssm);
-@@ -569,6 +610,20 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
+@@ -569,6 +613,30 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
            self->cmd_timeout = ELAN_FINGER_TIMEOUT;
            fpi_ssm_jump_to_state (ssm, CAPTURE_WAIT_FINGER);
          }
@@ -80,7 +83,17 @@ index 1b5d1e7..ce54e0c 100644
 +        {
 +          /* Finger still down: drop the oldest frame and keep polling until
 +           * it is lifted, otherwise the next calibration sees the finger. */
-+          GSList *oldest = g_slist_last (self->frames);
++          GSList *oldest;
++
++          if (!self->touch_submitted &&
++              self->num_frames >= self->touch_submit_frames)
++            {
++              fp_dbg ("touch: result submitted early, waiting for finger off");
++              self->touch_submitted = TRUE;
++              elan_submit_image (idev);
++            }
++
++          oldest = g_slist_last (self->frames);
 +
 +          g_free (oldest->data);
 +          self->frames = g_slist_delete_link (self->frames, oldest);
@@ -92,7 +105,28 @@ index 1b5d1e7..ce54e0c 100644
        else
          {
            fpi_ssm_next_state (ssm);
-@@ -602,6 +657,15 @@ capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
+@@ -585,8 +653,19 @@ capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
+ 
+   G_DEBUG_HERE ();
+ 
++  if ((self->dev_type & ELAN_TOUCH) && self->touch_submitted &&
++      (!error ||
++       g_error_matches (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO) ||
++       (g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT) &&
++        fpi_ssm_get_cur_state (ssm) == CAPTURE_WAIT_FINGER)))
++    {
++      /* The result was already reported; this was only the wait for the
++       * finger to be lifted. */
++      fp_dbg ("touch: finger lifted after early result");
++      g_clear_error (&error);
++    }
+   /* either max frames captured or timed out waiting for the next frame */
+-  if (!error ||
++  else if (!error ||
+       (g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT) &&
+        fpi_ssm_get_cur_state (ssm) == CAPTURE_WAIT_FINGER))
+     {
+@@ -602,6 +681,15 @@ capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
          }
        g_clear_error (&error);
      }
@@ -108,7 +142,7 @@ index 1b5d1e7..ce54e0c 100644
    else
      {
        fpi_image_device_session_error (dev, error);
-@@ -859,7 +923,8 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
+@@ -859,7 +947,8 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
            self->frame_height++;
            self->raw_frame_height = self->frame_height;
          }
@@ -118,7 +152,7 @@ index 1b5d1e7..ce54e0c 100644
          self->frame_height = ELAN_MAX_FRAME_HEIGHT;
        fp_dbg ("sensor dimensions, WxH: %dx%d", self->frame_width,
                self->raw_frame_height);
-@@ -927,6 +992,24 @@ dev_init (FpImageDevice *dev)
+@@ -927,6 +1016,28 @@ dev_init (FpImageDevice *dev)
        break;
      }
  
@@ -128,13 +162,17 @@ index 1b5d1e7..ce54e0c 100644
 +      gint threshold = ELAN_TOUCH_THRESHOLD;
 +      gint stages = ELAN_TOUCH_ENROLL_STAGES;
 +
++      self->touch_submit_frames = ELAN_TOUCH_SUBMIT_FRAMES;
++      if ((env = g_getenv ("ELAN_TOUCH_SUBMIT_FRAMES")) && atoi (env) > 0)
++        self->touch_submit_frames = atoi (env);
++
 +      if ((env = g_getenv ("ELAN_TOUCH_THRESHOLD")) && atoi (env) > 0)
 +        threshold = atoi (env);
 +      if ((env = g_getenv ("ELAN_TOUCH_ENROLL_STAGES")) && atoi (env) > 0)
 +        stages = atoi (env);
 +
-+      fp_dbg ("touch mode: SIFT matching, threshold %d, %d enroll stages",
-+              threshold, stages);
++      fp_dbg ("touch mode: SIFT matching, threshold %d, %d enroll stages, early submit at %d frames",
++              threshold, stages, self->touch_submit_frames);
 +      fpi_image_device_set_sigfm_threshold (dev, threshold);
 +      fpi_device_set_nr_enroll_stages (FP_DEVICE (dev), stages);
 +      fpi_device_set_scan_type (FP_DEVICE (dev), FP_SCAN_TYPE_PRESS);
@@ -144,10 +182,10 @@ index 1b5d1e7..ce54e0c 100644
  }
  
 diff --git a/libfprint/drivers/elan.h b/libfprint/drivers/elan.h
-index 7d08994..be37f48 100644
+index 7d08994..bc3b8ba 100644
 --- a/libfprint/drivers/elan.h
 +++ b/libfprint/drivers/elan.h
-@@ -31,6 +31,17 @@
+@@ -31,6 +31,21 @@
  #define ELAN_0907 (1 << 0)
  #define ELAN_0C03 (1 << 1)
  #define ELAN_0C42 (1 << 2)
@@ -162,10 +200,14 @@ index 7d08994..be37f48 100644
 + * finger is lifted, so calibration never runs with a finger on the sensor;
 + * give up waiting after this many extra frames (~10 s) */
 +#define ELAN_TOUCH_MAX_EXTRA_FRAMES 300
++/* touch mode reports the result (image submit -> match) as soon as this many
++ * frames are held, while the finger is still down; the lift wait continues
++ * afterwards */
++#define ELAN_TOUCH_SUBMIT_FRAMES ELAN_MAX_FRAMES
  
  /* devices which don't require frame rotation before assembling */
  #define ELAN_NOT_ROTATED ELAN_0C03
-@@ -219,7 +230,7 @@ static const FpIdEntry elan_id_table[] = {
+@@ -219,7 +234,7 @@ static const FpIdEntry elan_id_table[] = {
    {.vid = ELAN_VEND_ID,  .pid = 0x0c4d, .driver_data = ELAN_ALL_DEV},
    {.vid = ELAN_VEND_ID,  .pid = 0x0c4f, .driver_data = ELAN_ALL_DEV},
    {.vid = ELAN_VEND_ID,  .pid = 0x0c63, .driver_data = ELAN_ALL_DEV},
