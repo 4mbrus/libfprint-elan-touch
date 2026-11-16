@@ -193,7 +193,7 @@ index 1b5d1e7..1e9954a 100644
  }
  
 diff --git a/libfprint/drivers/elan.h b/libfprint/drivers/elan.h
-index 7d08994..bc3b8ba 100644
+index 7d08994..0a3ed43 100644
 --- a/libfprint/drivers/elan.h
 +++ b/libfprint/drivers/elan.h
 @@ -31,6 +31,21 @@
@@ -214,7 +214,7 @@ index 7d08994..bc3b8ba 100644
 +/* touch mode reports the result (image submit -> match) as soon as this many
 + * frames are held, while the finger is still down; the lift wait continues
 + * afterwards */
-+#define ELAN_TOUCH_SUBMIT_FRAMES ELAN_MAX_FRAMES
++#define ELAN_TOUCH_SUBMIT_FRAMES 15
  
  /* devices which don't require frame rotation before assembling */
  #define ELAN_NOT_ROTATED ELAN_0C03
